@@ -64,14 +64,14 @@ fi
 
 run_pope() {
     local answer_file="./playground/data/eval/pope/answers/$CKPT.jsonl"
-    python -m llava_lp.eval.model_vqa_loader \
+    python -m llava.eval.model_vqa_loader \
         "${COMMON_ARGS[@]}" \
         --question-file "./playground/data/eval/pope/llava_pope_test.jsonl" \
         --image-folder "./playground/data/eval/pope/val2014" \
         --answers-file "$answer_file"
 
     if [ "$RUN_EVAL" = "1" ]; then
-        python -m llava_lp.eval.eval_pope \
+        python -m llava.eval.eval_pope \
             --annotation-dir "./playground/data/eval/pope/coco" \
             --question-file "./playground/data/eval/pope/llava_pope_test.jsonl" \
             --result-file "$answer_file"

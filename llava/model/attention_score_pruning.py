@@ -196,4 +196,5 @@ def apply_vit_attention_score_pruning(
         attention_mask,
         position_ids,
         top_p=keep_ratio,
+        selection_mode="topk",
     )

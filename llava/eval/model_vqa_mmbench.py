@@ -6,11 +6,11 @@ import pandas as pd
 from tqdm import tqdm
 import shortuuid
 
-from llava_lp.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava_lp.conversation import conv_templates, SeparatorStyle
-from llava_lp.utils import disable_torch_init
-from llava_lp.mm_utils import tokenizer_image_token, process_images, load_image_from_base64, get_model_name_from_path
-from llava_lp.eval.vision_pruner_utils import (
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.conversation import conv_templates, SeparatorStyle
+from llava.utils import disable_torch_init
+from llava.mm_utils import tokenizer_image_token, process_images, load_image_from_base64, get_model_name_from_path
+from llava.eval.vision_pruner_utils import (
     add_model_loading_args,
     add_vision_pruner_args,
     build_generation_kwargs,

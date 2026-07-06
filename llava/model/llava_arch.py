@@ -380,9 +380,9 @@ class LlavaMetaModel_with_VisionPruner(LlavaMetaModel):
             vision_pruner = vision_pruner[0]
         return vision_pruner
 
-    def initialize_vision_pruner(self, decoder_layer):     
+    def initialize_vision_pruner(self, value_layer, context_layer, rotary_emb=None):
         if self.get_vision_pruner() is None:
-            self.vision_pruner = build_vision_pruner(decoder_layer)
+            self.vision_pruner = build_vision_pruner(value_layer, context_layer, rotary_emb=rotary_emb)
 
 
 class LlavaMetaForCausalLM_with_VisionPruner(LlavaMetaForCausalLM):

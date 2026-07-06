@@ -136,6 +136,7 @@ def should_use_vision_pruner(args, model_path):
     config = _local_config(expanded)
     return (
         config.get("model_type") == "llava_llama_with_vision_pruner"
+        or "vision_pruner_value_layer_idx" in config
         or "vision_pruner_decoder_layer_idx" in config
     )
 
@@ -144,6 +145,9 @@ def resolve_vision_pruner_keep_ratio(args):
     token_budget = getattr(args, "vision_pruner_token_budget", None)
     keep_ratio = getattr(args, "vision_pruner_top_p", None)
 
+    if token_budget is None and keep_ratio is None:
+        return None
+
     if token_budget is not None:
         if token_budget <= 0:
             raise ValueError("--vision-pruner-token-budget must be positive.")
@@ -151,9 +155,6 @@ def resolve_vision_pruner_keep_ratio(args):
         if num_image_tokens <= 0:
             raise ValueError("--vision-pruner-num-image-tokens must be positive.")
         keep_ratio = token_budget / float(num_image_tokens)
-
-    if keep_ratio is None:
-        keep_ratio = 1.0
 
     if keep_ratio <= 0 or keep_ratio > 1:
         raise ValueError(
@@ -310,7 +311,7 @@ def debug_vision_pruner_weights(model, model_path):
 
 
 def load_eval_model(args, model_path, model_name) -> Tuple[object, object, object, int]:
-    from llava_lp.model.builder import (
+    from llava.model.builder import (
         load_pretrained_model,
         load_pretrained_model_with_VisionPruner,
     )
@@ -320,6 +321,7 @@ def load_eval_model(args, model_path, model_name) -> Tuple[object, object, objec
     args._use_vision_pruner = use_vision_pruner
     args._use_attention_score_pruning = use_attention_score_pruning
     args._vision_pruner_keep_ratio = resolve_vision_pruner_keep_ratio(args)
+    args._vision_pruner_use_legacy_topk = args._vision_pruner_keep_ratio is not None
     args._attention_score_pruning_keep_ratio = resolve_attention_score_pruning_keep_ratio(args)
 
     if use_attention_score_pruning:
@@ -384,7 +386,11 @@ def build_generation_kwargs(args, max_new_tokens):
             args, "attention_score_pruning_head_reduction", "mean"
         )
     elif getattr(args, "_use_vision_pruner", False):
-        kwargs["top_p"] = getattr(args, "_vision_pruner_keep_ratio", 1.0)
+        if getattr(args, "_vision_pruner_use_legacy_topk", False):
+            kwargs["top_p"] = getattr(args, "_vision_pruner_keep_ratio")
+            kwargs["vision_pruner_selection_mode"] = "topk"
+        else:
+            kwargs["vision_pruner_selection_mode"] = "threshold"
     elif getattr(args, "top_p", None) is not None:
         kwargs["top_p"] = args.top_p
 

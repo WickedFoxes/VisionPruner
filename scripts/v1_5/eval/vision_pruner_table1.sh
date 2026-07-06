@@ -65,7 +65,7 @@ else
 fi
 
 if [ "$VISION_PRUNER_DEBUG_WEIGHTS_ONLY" = "1" ]; then
-    python -m llava_lp.eval.model_vqa_loader \
+    python -m llava.eval.model_vqa_loader \
         "${COMMON_ARGS[@]}" \
         --question-file "./playground/data/eval/pope/llava_pope_test.jsonl" \
         --image-folder "./playground/data/eval/pope/val2014" \
@@ -83,7 +83,7 @@ run_gqa() {
 
     mkdir -p "$answer_dir"
     for idx in $(seq 0 $((chunks - 1))); do
-        CUDA_VISIBLE_DEVICES="${GPULIST[$idx]}" python -m llava_lp.eval.model_vqa_loader \
+        CUDA_VISIBLE_DEVICES="${GPULIST[$idx]}" python -m llava.eval.model_vqa_loader \
             "${COMMON_ARGS[@]}" \
             --question-file "./playground/data/eval/gqa/$split.jsonl" \
             --image-folder "./playground/data/eval/gqa/data/images" \
@@ -117,7 +117,7 @@ run_vqav2() {
 
     mkdir -p "$answer_dir"
     for idx in $(seq 0 $((chunks - 1))); do
-        CUDA_VISIBLE_DEVICES="${GPULIST[$idx]}" python -m llava_lp.eval.model_vqa_loader \
+        CUDA_VISIBLE_DEVICES="${GPULIST[$idx]}" python -m llava.eval.model_vqa_loader \
             "${COMMON_ARGS[@]}" \
             --question-file "./playground/data/eval/vqav2/$split.jsonl" \
             --image-folder "./playground/data/eval/vqav2/test2015" \
@@ -138,14 +138,14 @@ run_vqav2() {
 
 run_textvqa() {
     local answer_file="./playground/data/eval/textvqa/answers/$CKPT.jsonl"
-    python -m llava_lp.eval.model_vqa_loader \
+    python -m llava.eval.model_vqa_loader \
         "${COMMON_ARGS[@]}" \
         --question-file "./playground/data/eval/textvqa/llava_textvqa_val_v051_ocr.jsonl" \
         --image-folder "./playground/data/eval/textvqa/train_images" \
         --answers-file "$answer_file"
 
     if [ "$RUN_EVAL" = "1" ]; then
-        python -m llava_lp.eval.eval_textvqa \
+        python -m llava.eval.eval_textvqa \
             --annotation-file "./playground/data/eval/textvqa/TextVQA_0.5.1_val.json" \
             --result-file "$answer_file"
     fi
@@ -153,14 +153,14 @@ run_textvqa() {
 
 run_pope() {
     local answer_file="./playground/data/eval/pope/answers/$CKPT.jsonl"
-    python -m llava_lp.eval.model_vqa_loader \
+    python -m llava.eval.model_vqa_loader \
         "${COMMON_ARGS[@]}" \
         --question-file "./playground/data/eval/pope/llava_pope_test.jsonl" \
         --image-folder "./playground/data/eval/pope/val2014" \
         --answers-file "$answer_file"
 
     if [ "$RUN_EVAL" = "1" ]; then
-        python -m llava_lp.eval.eval_pope \
+        python -m llava.eval.eval_pope \
             --annotation-dir "./playground/data/eval/pope/coco" \
             --question-file "./playground/data/eval/pope/llava_pope_test.jsonl" \
             --result-file "$answer_file"
@@ -169,7 +169,7 @@ run_pope() {
 
 run_mme() {
     local answer_file="./playground/data/eval/MME/answers/$CKPT.jsonl"
-    python -m llava_lp.eval.model_vqa_loader \
+    python -m llava.eval.model_vqa_loader \
         "${COMMON_ARGS[@]}" \
         --question-file "./playground/data/eval/MME/llava_mme.jsonl" \
         --image-folder "./playground/data/eval/MME/MME_Benchmark_release_version" \
@@ -191,7 +191,7 @@ run_mmbench() {
     local upload_dir="./playground/data/eval/mmbench/answers_upload/$split"
     mkdir -p "$answer_dir" "$upload_dir"
 
-    python -m llava_lp.eval.model_vqa_mmbench \
+    python -m llava.eval.model_vqa_mmbench \
         "${COMMON_ARGS[@]}" \
         --question-file "./playground/data/eval/mmbench/$split.tsv" \
         --answers-file "$answer_dir/$CKPT.jsonl" \
@@ -210,7 +210,7 @@ run_mmbench_cn() {
     local upload_dir="./playground/data/eval/mmbench_cn/answers_upload/$split"
     mkdir -p "$answer_dir" "$upload_dir"
 
-    python -m llava_lp.eval.model_vqa_mmbench \
+    python -m llava.eval.model_vqa_mmbench \
         "${COMMON_ARGS[@]}" \
         --question-file "./playground/data/eval/mmbench_cn/$split.tsv" \
         --answers-file "$answer_dir/$CKPT.jsonl" \
@@ -226,7 +226,7 @@ run_mmbench_cn() {
 
 run_sqa() {
     local answer_file="./playground/data/eval/scienceqa/answers/$CKPT.jsonl"
-    python -m llava_lp.eval.model_vqa_science \
+    python -m llava.eval.model_vqa_science \
         "${COMMON_ARGS[@]}" \
         --question-file "./playground/data/eval/scienceqa/llava_test_CQM-A.json" \
         --image-folder "./playground/data/eval/scienceqa/images/test" \
@@ -234,7 +234,7 @@ run_sqa() {
         --single-pred-prompt
 
     if [ "$RUN_EVAL" = "1" ]; then
-        python -m llava_lp.eval.eval_science_qa \
+        python -m llava.eval.eval_science_qa \
             --base-dir "./playground/data/eval/scienceqa" \
             --result-file "$answer_file" \
             --output-file "./playground/data/eval/scienceqa/answers/${CKPT}_output.jsonl" \

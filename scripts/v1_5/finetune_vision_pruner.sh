@@ -6,24 +6,15 @@ DATA_PATH=${DATA_PATH:-./playground/data/llava_instruct_150k.json}
 DATA_FRACTION=${DATA_FRACTION:-1.0}
 DATA_SEED=${DATA_SEED:-42}
 IMAGE_FOLDER=${IMAGE_FOLDER:-./playground/data/coco/train2017}
-VISION_PRUNER_TRAIN_MODE=${VISION_PRUNER_TRAIN_MODE:-}
-VISION_PRUNER_INIT_MODE=${VISION_PRUNER_INIT_MODE:-llm}
 OUTPUT_DIR=${OUTPUT_DIR:-./checkpoints/llava-v1.5-7b-vision-pruner}
 ADAM_EPSILON=${ADAM_EPSILON:-1e-6}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-0.1}
 
 if [[ -z "${LEARNING_RATE+x}" ]]; then
-    case "$VISION_PRUNER_TRAIN_MODE" in
-        llm_freeze_q|llm_freeze_k|llm_freeze_kv|llm_freeze_kv_random_rest|llm_freeze_v_ffn|llm_freeze_v_ffn_random_rest)
-            LEARNING_RATE=1e-6
-            ;;
-        *)
-            LEARNING_RATE=2e-5
-            ;;
-    esac
+    LEARNING_RATE=2e-5
 fi
 
-deepspeed --num_gpus 2 llava_lp/train/train_vision_pruner.py \
+deepspeed --num_gpus 2 llava/train/train_vision_pruner.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path liuhaotian/llava-v1.5-7b \
     --version v1 \
@@ -36,11 +27,10 @@ deepspeed --num_gpus 2 llava_lp/train/train_vision_pruner.py \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
-    --vision_pruner_train_mode "$VISION_PRUNER_TRAIN_MODE" \
-    --vision_pruner_init_mode "$VISION_PRUNER_INIT_MODE" \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
-    --vision_pruner_decoder_layer_idx 0 \
+    --vision_pruner_value_layer_idx 0 \
+    --vision_pruner_context_layer_idx 9 \
     --bf16 True \
     --output_dir "$OUTPUT_DIR" \
     --num_train_epochs 1 \

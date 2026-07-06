@@ -1,4 +1,4 @@
-# Adopted from llava_lp/train/train.py
+# Adopted from llava/train/train.py
 # Modified for vision_pruner-only fine-tuning:
 #   - All parameters are frozen except LlavaMetaModel_with_VisionPruner.vision_pruner
 #   - Checkpoints save only VisionPruner weights plus lightweight metadata
@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import random
-from typing import Dict, Optional, Sequence, Set
+from typing import Dict, Optional, Sequence
 
 import torch
 
@@ -26,8 +26,10 @@ from llava.constants import (
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
-VISION_PRUNER_SCORE_NOISE_TAIL_THRESHOLD = 0.1
-VISION_PRUNER_DEFAULT_SCORE_NOISE_STD = VISION_PRUNER_SCORE_NOISE_TAIL_THRESHOLD / 1.959963984540054
+VISION_PRUNER_TRAINABLE_KEYS = [
+    "vision_pruner.text_q_proj",
+    "vision_pruner.image_k_proj",
+]
 
 
 class VisionPrunerTrainer(LLaVATrainer):
@@ -160,17 +162,6 @@ class VisionPrunerTrainer(LLaVATrainer):
             module = module.get_model()
         return getattr(module, "vision_pruner", None)
 
-    def _update_vision_pruner_score_noise(self, model):
-        vision_pruner = self._get_vision_pruner_module(model)
-        if vision_pruner is None:
-            return None
-
-        std = float(self.args.vision_pruner_score_noise_std)
-        vision_pruner.score_noise_std = std
-        vision_pruner.score_noise_variance = std ** 2
-        vision_pruner.score_noise_tail_threshold = VISION_PRUNER_SCORE_NOISE_TAIL_THRESHOLD
-        return std
-
     def _vision_pruner_stats(self, model):
         stats = []
         for name, param in model.named_parameters():
@@ -206,30 +197,15 @@ class VisionPrunerTrainer(LLaVATrainer):
         stats = self._vision_pruner_stats(model)
         param_norm = sum(norm ** 2 for _, norm, _ in stats) ** 0.5
         max_param_abs = max((max_abs for _, _, max_abs in stats), default=0.0)
-        vision_pruner = self._get_vision_pruner_module(model)
-        score_noise_std = float(getattr(vision_pruner, "score_noise_std", 0.0) or 0.0)
-        score_noise_variance = float(getattr(vision_pruner, "score_noise_variance", 0.0) or 0.0)
-        score_noise_last_std = float(getattr(vision_pruner, "score_noise_last_std", 0.0) or 0.0)
-        score_noise_tail_threshold = float(
-            getattr(vision_pruner, "score_noise_tail_threshold", VISION_PRUNER_SCORE_NOISE_TAIL_THRESHOLD)
-            or VISION_PRUNER_SCORE_NOISE_TAIL_THRESHOLD
-        )
-        score_noise_tail_ratio = float(
-            getattr(vision_pruner, "score_noise_last_abs_ge_threshold_ratio", 0.0) or 0.0
-        )
 
         print(
             f"[vision_pruner] step={self.state.global_step} "
             f"trainable_params={trainable_count:,} grad_none_tensors={grad_none_count} "
             f"grad_norm={total_grad_norm:.6e} max_grad_abs={max_grad_abs:.6e} "
-            f"param_norm={param_norm:.6e} max_param_abs={max_param_abs:.6e} "
-            f"score_noise_std={score_noise_std:.6f} score_noise_variance={score_noise_variance:.6f} "
-            f"last_noise_std={score_noise_last_std:.6f} "
-            f"last_abs_noise>={score_noise_tail_threshold:.1f}={score_noise_tail_ratio:.4f}"
+            f"param_norm={param_norm:.6e} max_param_abs={max_param_abs:.6e}"
         )
 
     def training_step(self, model, inputs, *args, **kwargs):
-        self._update_vision_pruner_score_noise(model)
         loss = super().training_step(model, inputs, *args, **kwargs)
 
         if self.state.global_step % self.args.logging_steps == 0 or self.state.global_step == 1:
@@ -240,9 +216,10 @@ class VisionPrunerTrainer(LLaVATrainer):
 from llava import conversation as conversation_lib
 from llava.mm_utils import tokenizer_image_token
 
-from llava_lp.model.language_model.llava_llama import (
-    IMAGE_SPARSE_LOSS_WEIGHT,
-    TEXT_SPARSE_LOSS_WEIGHT,
+from llava.model.language_model.llava_llama import (
+    LAMBDA_SPARSE,
+    RHO,
+    TAU,
     VISION_PRUNER_ATTENTION_PRE_PRUNE_HEAD_REDUCTION,
     VISION_PRUNER_ATTENTION_PRE_PRUNE_KEEP_RATIO,
     LlavaLlamaForCausalLM_with_VisionPruner,
@@ -276,35 +253,28 @@ class ModelArguments:
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
     # VisionPruner-specific
-    vision_pruner_decoder_layer_idx: int = field(
+    vision_pruner_value_layer_idx: int = field(
         default=0,
-        metadata={"help": "Index of the LLaMA decoder layer to deepcopy for LlavaImagePruner."}
+        metadata={"help": "LLaMA decoder layer index used for the fixed VisionPruner value path."}
+    )
+    vision_pruner_context_layer_idx: int = field(
+        default=9,
+        metadata={"help": "LLaMA decoder layer index used for the fixed VisionPruner context layer."}
+    )
+    vision_pruner_decoder_layer_idx: Optional[int] = field(
+        default=None,
+        metadata={"help": "Legacy alias for vision_pruner_value_layer_idx."}
     )
     vision_pruner_train_mode: Optional[str] = field(
         default=None,
         metadata={
-            "help": (
-                "VisionPruner training mode. "
-                "Use 'llm_full' for LLM-initialized full training, "
-                "'random_full' for fully reinitialized full training, "
-                "'llm_freeze_q' for LLM-initialized training with Q frozen, "
-                "'llm_freeze_k' for LLM-initialized training with K frozen, "
-                "'llm_freeze_kv' for LLM-initialized training with K/V frozen, "
-                "'llm_freeze_kv_random_rest' for LLM K/V frozen and all other weights reinitialized, "
-                "'llm_freeze_v_ffn' for LLM-initialized training with V and FFN frozen, "
-                "or 'llm_freeze_v_ffn_random_rest' for LLM V/FFN frozen and all other weights reinitialized. "
-                "If omitted, vision_pruner_init_mode selects llm_full or random_full."
-            )
+            "help": "Deprecated compatibility argument. The new VisionPruner always trains text_q_proj/image_k_proj."
         },
     )
     vision_pruner_init_mode: str = field(
         default="llm",
         metadata={
-            "help": (
-                "Legacy VisionPruner initialization mode used when vision_pruner_train_mode is omitted. "
-                "'llm' starts from the selected LLM decoder layer. "
-                "'random' reinitializes VisionPruner."
-            )
+            "help": "Deprecated compatibility argument. The new VisionPruner always uses LLM-initialized paths."
         },
     )
 
@@ -362,34 +332,6 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     group_by_modality_length: bool = field(default=False)
     mm_projector_lr: Optional[float] = field(default=None)
-    vision_pruner_score_noise_std: float = field(
-        default=VISION_PRUNER_DEFAULT_SCORE_NOISE_STD,
-        metadata={
-            "help": (
-                "Fixed standard deviation for Gaussian noise added to VisionPruner scores during "
-                "training. The default is 0.1 / z_0.975 ~= 0.051021, so about 5% of sampled "
-                "noise values have absolute magnitude greater than or equal to 0.1."
-            )
-        },
-    )
-    vision_pruner_score_noise_start: float = field(
-        default=2.0,
-        metadata={
-            "help": (
-                "Deprecated compatibility argument. VisionPruner score noise now uses the fixed "
-                "Gaussian std from vision_pruner_score_noise_std instead of a decaying schedule."
-            )
-        },
-    )
-    vision_pruner_score_noise_end: float = field(
-        default=0.02,
-        metadata={
-            "help": (
-                "Deprecated compatibility argument. VisionPruner score noise now uses the fixed "
-                "Gaussian std from vision_pruner_score_noise_std instead of a decaying schedule."
-            )
-        },
-    )
     vision_pruner_max_param_abs: float = field(
         default=1e6,
         metadata={
@@ -431,176 +373,6 @@ def get_mm_adapter_state_maybe_zero_3(model, keys_to_match):
     return to_return
 
 
-VISION_PRUNER_INIT_ALIASES = {
-    "llm": "llm",
-    "llm_init": "llm",
-    "default": "llm",
-    "random": "random",
-    "random_init": "random",
-    "scratch": "random",
-}
-
-@dataclass
-class VisionPrunerTrainingMode:
-    name: str
-    reinitialize: bool
-    preserve_components: Set[str]
-    frozen_components: Set[str]
-
-
-VISION_PRUNER_TRAIN_MODES = {
-    "llm_full": VisionPrunerTrainingMode(
-        name="llm_full",
-        reinitialize=False,
-        preserve_components=set(),
-        frozen_components=set(),
-    ),
-    "random_full": VisionPrunerTrainingMode(
-        name="random_full",
-        reinitialize=True,
-        preserve_components=set(),
-        frozen_components=set(),
-    ),
-    "llm_freeze_q": VisionPrunerTrainingMode(
-        name="llm_freeze_q",
-        reinitialize=False,
-        preserve_components=set(),
-        frozen_components={"q_proj"},
-    ),
-    "llm_freeze_k": VisionPrunerTrainingMode(
-        name="llm_freeze_k",
-        reinitialize=False,
-        preserve_components=set(),
-        frozen_components={"k_proj"},
-    ),
-    "llm_freeze_kv": VisionPrunerTrainingMode(
-        name="llm_freeze_kv",
-        reinitialize=False,
-        preserve_components=set(),
-        frozen_components={"k_proj", "v_proj"},
-    ),
-    "llm_freeze_kv_random_rest": VisionPrunerTrainingMode(
-        name="llm_freeze_kv_random_rest",
-        reinitialize=True,
-        preserve_components={"k_proj", "v_proj"},
-        frozen_components={"k_proj", "v_proj"},
-    ),
-    "llm_freeze_v_ffn": VisionPrunerTrainingMode(
-        name="llm_freeze_v_ffn",
-        reinitialize=False,
-        preserve_components=set(),
-        frozen_components={"v_proj", "ffn"},
-    ),
-    "llm_freeze_v_ffn_random_rest": VisionPrunerTrainingMode(
-        name="llm_freeze_v_ffn_random_rest",
-        reinitialize=True,
-        preserve_components={"v_proj", "ffn"},
-        frozen_components={"v_proj", "ffn"},
-    ),
-}
-VISION_PRUNER_TRAIN_MODE_ALIASES = {
-    "llm_full": "llm_full",
-    "random_full": "random_full",
-    "llm_freeze_q": "llm_freeze_q",
-    "llm_freeze_k": "llm_freeze_k",
-    "llm_freeze_kv": "llm_freeze_kv",
-    "llm_freeze_kv_random_rest": "llm_freeze_kv_random_rest",
-    "llm_freeze_v_ffn": "llm_freeze_v_ffn",
-    "llm_freeze_v_ffn_random_rest": "llm_freeze_v_ffn_random_rest",
-}
-
-
-def _copy_vision_pruner_training_mode(mode: VisionPrunerTrainingMode) -> VisionPrunerTrainingMode:
-    return VisionPrunerTrainingMode(
-        name=mode.name,
-        reinitialize=mode.reinitialize,
-        preserve_components=set(mode.preserve_components),
-        frozen_components=set(mode.frozen_components),
-    )
-
-
-def _parse_vision_pruner_train_mode(train_mode: Optional[str]) -> Optional[VisionPrunerTrainingMode]:
-    if train_mode is None:
-        return None
-
-    train_mode = train_mode.lower().strip()
-    if not train_mode or train_mode == "none":
-        return None
-    if train_mode not in VISION_PRUNER_TRAIN_MODE_ALIASES:
-        raise ValueError(
-            f"Unknown vision_pruner_train_mode='{train_mode}'. "
-            f"Expected one of {sorted(VISION_PRUNER_TRAIN_MODE_ALIASES)}."
-        )
-
-    canonical_mode = VISION_PRUNER_TRAIN_MODE_ALIASES[train_mode]
-    return _copy_vision_pruner_training_mode(VISION_PRUNER_TRAIN_MODES[canonical_mode])
-
-
-def _validate_vision_pruner_init_mode(init_mode: str) -> str:
-    init_mode = init_mode.lower().strip()
-    if init_mode not in VISION_PRUNER_INIT_ALIASES:
-        raise ValueError(
-            f"Unknown vision_pruner_init_mode='{init_mode}'. "
-            f"Expected one of {sorted(VISION_PRUNER_INIT_ALIASES)}."
-        )
-    return VISION_PRUNER_INIT_ALIASES[init_mode]
-
-
-def _resolve_vision_pruner_training_mode(
-    train_mode: Optional[str],
-    init_mode: str,
-) -> VisionPrunerTrainingMode:
-    parsed_train_mode = _parse_vision_pruner_train_mode(train_mode)
-    if parsed_train_mode is not None:
-        return parsed_train_mode
-
-    init_mode = _validate_vision_pruner_init_mode(init_mode)
-    if init_mode == "llm":
-        return _copy_vision_pruner_training_mode(VISION_PRUNER_TRAIN_MODES["llm_full"])
-    return _copy_vision_pruner_training_mode(VISION_PRUNER_TRAIN_MODES["random_full"])
-
-
-def _is_vision_pruner_component_param(name: str, components: Set[str]) -> bool:
-    normalized_name = f".{name}."
-    return (
-        ("q_proj" in components and ".self_attn.q_proj." in normalized_name)
-        or ("k_proj" in components and ".self_attn.k_proj." in normalized_name)
-        or ("v_proj" in components and ".self_attn.v_proj." in normalized_name)
-        or ("ffn" in components and ".mlp." in normalized_name)
-    )
-
-
-def _format_vision_pruner_components(components: Set[str]) -> str:
-    ordered_components = [component for component in ("q_proj", "k_proj", "v_proj", "ffn") if component in components]
-    return ",".join(ordered_components) if ordered_components else "none"
-
-
-def _clone_vision_pruner_component_state(vision_pruner, components: Set[str]) -> Dict[str, torch.Tensor]:
-    return {
-        name: param.detach().cpu().clone()
-        for name, param in vision_pruner.named_parameters()
-        if _is_vision_pruner_component_param(name, components)
-    }
-
-
-def _restore_vision_pruner_component_state(vision_pruner, component_state: Dict[str, torch.Tensor]) -> int:
-    restored_count = 0
-    named_params = dict(vision_pruner.named_parameters())
-    for name, value in component_state.items():
-        if name not in named_params:
-            raise ValueError(f"Cannot restore preserved VisionPruner parameter '{name}': parameter not found.")
-        param = named_params[name]
-        if param.shape != value.shape:
-            raise ValueError(
-                f"Cannot restore preserved VisionPruner parameter '{name}': "
-                f"shape mismatch preserved={tuple(value.shape)} current={tuple(param.shape)}."
-            )
-        with torch.no_grad():
-            param.copy_(value.to(device=param.device, dtype=param.dtype))
-        restored_count += param.numel()
-    return restored_count
-
-
 def _register_vision_pruner_gradient_nan_guard(vision_pruner) -> int:
     hook_count = 0
     for name, param in vision_pruner.named_parameters():
@@ -623,29 +395,6 @@ def _register_vision_pruner_gradient_nan_guard(vision_pruner) -> int:
         param.register_hook(check_gradient)
         hook_count += 1
     return hook_count
-
-
-def _reinitialize_vision_pruner_parameters(model):
-    vision_pruner = model.get_model().get_vision_pruner()
-    if vision_pruner is None:
-        raise ValueError("VisionPruner must be initialized before its parameters can be reinitialized.")
-
-    init_weights = getattr(model, "_init_weights", None)
-    if callable(init_weights):
-        vision_pruner.apply(init_weights)
-    else:
-        for module in vision_pruner.modules():
-            reset_parameters = getattr(module, "reset_parameters", None)
-            if callable(reset_parameters):
-                reset_parameters()
-
-    for module in vision_pruner.modules():
-        module_name = module.__class__.__name__.lower()
-        if isinstance(module, torch.nn.LayerNorm) or "rmsnorm" in module_name:
-            if getattr(module, "weight", None) is not None:
-                module.weight.data.fill_(1.0)
-            if getattr(module, "bias", None) is not None:
-                module.bias.data.zero_()
 
 
 def _normalize_vision_pruner_key(key: str) -> str:
@@ -701,7 +450,7 @@ def _summarize_vision_pruner_delta(initial_state: Dict[str, torch.Tensor],
 
 
 def save_vision_pruner_checkpoint(trainer: transformers.Trainer, output_dir: str) -> Dict[str, torch.Tensor]:
-    weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model, ['vision_pruner'])
+    weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model, VISION_PRUNER_TRAINABLE_KEYS)
     torch.save(weight_to_save, os.path.join(output_dir, 'vision_pruner.bin'))
 
     initial_state = getattr(trainer, "vision_pruner_initial_state", None)
@@ -1271,21 +1020,11 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
-    if training_args.vision_pruner_score_noise_std < 0:
-        raise ValueError(
-            "vision_pruner_score_noise_std must be non-negative, "
-            f"got {training_args.vision_pruner_score_noise_std}"
-        )
     if training_args.vision_pruner_max_param_abs < 0:
         raise ValueError(
             "vision_pruner_max_param_abs must be non-negative, "
             f"got {training_args.vision_pruner_max_param_abs}"
         )
-    vision_pruner_mode = _resolve_vision_pruner_training_mode(
-        model_args.vision_pruner_train_mode,
-        model_args.vision_pruner_init_mode,
-    )
-    os.environ["LLAVA_ATTENTION_SCORE_PRUNING"] = "1"
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
     bnb_model_from_pretrained_args = {}
@@ -1366,94 +1105,59 @@ def train(attn_implementation=None):
     model.config.tokenizer_model_max_length = tokenizer.model_max_length
     model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
     model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
-    model.config.vision_pruner_decoder_layer_idx = model_args.vision_pruner_decoder_layer_idx
-    model.config.vision_pruner_train_mode = vision_pruner_mode.name
-    model.config.vision_pruner_init_mode = "random" if vision_pruner_mode.reinitialize else "llm"
-    model.config.vision_pruner_preserve_components = _format_vision_pruner_components(
-        vision_pruner_mode.preserve_components
+    value_layer_idx = (
+        model_args.vision_pruner_decoder_layer_idx
+        if model_args.vision_pruner_decoder_layer_idx is not None
+        else model_args.vision_pruner_value_layer_idx
     )
-    model.config.vision_pruner_freeze_components = _format_vision_pruner_components(
-        vision_pruner_mode.frozen_components
-    )
-    model.config.vision_pruner_score_noise_std = training_args.vision_pruner_score_noise_std
-    model.config.vision_pruner_score_noise_tail_threshold = VISION_PRUNER_SCORE_NOISE_TAIL_THRESHOLD
-    model.config.vision_pruner_score_noise_start = training_args.vision_pruner_score_noise_start
-    model.config.vision_pruner_score_noise_end = training_args.vision_pruner_score_noise_end
+    context_layer_idx = model_args.vision_pruner_context_layer_idx
+    num_layers = len(model.model.layers)
+    if value_layer_idx < 0 or value_layer_idx >= num_layers:
+        raise ValueError(
+            f"vision_pruner_value_layer_idx must be in [0, {num_layers - 1}], got {value_layer_idx}."
+        )
+    if context_layer_idx < 0 or context_layer_idx >= num_layers:
+        raise ValueError(
+            f"vision_pruner_context_layer_idx must be in [0, {num_layers - 1}], got {context_layer_idx}."
+        )
+    model.config.vision_pruner_value_layer_idx = value_layer_idx
+    model.config.vision_pruner_context_layer_idx = context_layer_idx
+    model.config.vision_pruner_decoder_layer_idx = value_layer_idx
+    model.config.vision_pruner_tau = TAU
+    model.config.vision_pruner_rho = RHO
+    model.config.vision_pruner_lambda_sparse = LAMBDA_SPARSE
     model.config.vision_pruner_max_param_abs = training_args.vision_pruner_max_param_abs
-    model.config.vision_pruner_image_sparse_loss_weight = IMAGE_SPARSE_LOSS_WEIGHT
-    model.config.vision_pruner_text_sparse_loss_weight = TEXT_SPARSE_LOSS_WEIGHT
     model.config.vision_pruner_attention_pre_prune_keep_ratio = VISION_PRUNER_ATTENTION_PRE_PRUNE_KEEP_RATIO
     model.config.vision_pruner_attention_pre_prune_layer = None
     model.config.vision_pruner_attention_pre_prune_head_reduction = VISION_PRUNER_ATTENTION_PRE_PRUNE_HEAD_REDUCTION
-    model.config.vision_pruner_prune_question_text_during_training = True
+    model.config.vision_pruner_prune_question_text_during_training = False
     model.config.vision_pruner_base_model_name_or_path = model_args.model_name_or_path
     model.config.vision_pruner_vision_tower = model_args.vision_tower
 
     # ── Freeze everything ────────────────────────────────────────────────────
     model.requires_grad_(False)
 
-    # ── Initialize VisionPruner from a decoder layer ─────────────────────────
+    # ── Initialize VisionPruner from fixed LLaMA layers ──────────────────────
     # deepcopy happens here (before DeepSpeed sharding) on the full CPU model
-    decoder_layer_idx = model_args.vision_pruner_decoder_layer_idx
     rank0_print(
-        f"Initializing VisionPruner from decoder layer {decoder_layer_idx} "
-        f"(train_mode={vision_pruner_mode.name})..."
+        "Initializing VisionPruner "
+        f"(value_layer={value_layer_idx}, context_layer={context_layer_idx})..."
     )
-    model.get_model().initialize_vision_pruner(model.model.layers[decoder_layer_idx])
-    preserved_component_state = {}
-    if vision_pruner_mode.preserve_components:
-        preserved_component_state = _clone_vision_pruner_component_state(
-            model.get_model().vision_pruner,
-            vision_pruner_mode.preserve_components,
-        )
-        rank0_print(
-            "Preserving LLM-initialized VisionPruner components before reinit: "
-            f"{_format_vision_pruner_components(vision_pruner_mode.preserve_components)} "
-            f"({sum(t.numel() for t in preserved_component_state.values()):,} params)"
-        )
-    if vision_pruner_mode.reinitialize:
-        rank0_print("Reinitializing VisionPruner parameters with the model initializer...")
-        _reinitialize_vision_pruner_parameters(model)
-    if preserved_component_state:
-        restored_param_count = _restore_vision_pruner_component_state(
-            model.get_model().vision_pruner,
-            preserved_component_state,
-        )
-        rank0_print(
-            "Restored preserved LLM-initialized VisionPruner components: "
-            f"{_format_vision_pruner_components(vision_pruner_mode.preserve_components)} "
-            f"({restored_param_count:,} params)"
-        )
-    model.get_model().vision_pruner.score_noise_std = training_args.vision_pruner_score_noise_std
-    model.get_model().vision_pruner.score_noise_variance = training_args.vision_pruner_score_noise_std ** 2
-    model.get_model().vision_pruner.score_noise_tail_threshold = VISION_PRUNER_SCORE_NOISE_TAIL_THRESHOLD
-    model.get_model().vision_pruner.score_noise_last_std = 0.0
-    model.get_model().vision_pruner.score_noise_last_abs_ge_threshold_ratio = 0.0
+    model.get_model().initialize_vision_pruner(
+        model.model.layers[value_layer_idx],
+        model.model.layers[context_layer_idx],
+        rotary_emb=getattr(model.model, "rotary_emb", None),
+    )
     model.get_model().vision_pruner.to(dtype=torch.float32, device=training_args.device)
-    # Train every parameter inside vision_pruner. The rest of the model remains frozen
-    # because model.requires_grad_(False) was applied before the pruner was re-enabled.
-    frozen_param_count = 0
-    frozen_tensor_names = []
+
+    trainable_pruner_prefixes = ("text_q_proj.", "image_k_proj.")
     for name, param in model.get_model().vision_pruner.named_parameters():
-        if _is_vision_pruner_component_param(name, vision_pruner_mode.frozen_components):
-            param.requires_grad_(False)
-            frozen_param_count += param.numel()
-            frozen_tensor_names.append(name)
-        else:
-            param.requires_grad_(True)
+        param.requires_grad_(name.startswith(trainable_pruner_prefixes))
 
     nan_guard_hook_count = _register_vision_pruner_gradient_nan_guard(model.get_model().vision_pruner)
 
-    initial_vision_pruner_state = get_mm_adapter_state_maybe_zero_3(model, ['vision_pruner'])
+    initial_vision_pruner_state = get_mm_adapter_state_maybe_zero_3(model, VISION_PRUNER_TRAINABLE_KEYS)
 
-    if vision_pruner_mode.frozen_components:
-        rank0_print(
-            "Frozen VisionPruner components: "
-            f"{_format_vision_pruner_components(vision_pruner_mode.frozen_components)} "
-            f"({frozen_param_count:,} params)"
-        )
-        for name in frozen_tensor_names:
-            rank0_print(f"  frozen: vision_pruner.{name}")
     rank0_print(f"VisionPruner gradient NaN guard registered on {nan_guard_hook_count} trainable tensors.")
 
     rank0_print("Trainable parameters:")
@@ -1465,22 +1169,17 @@ def train(attn_implementation=None):
     rank0_print(f"Total trainable parameters: {trainable_param_count:,}")
     rank0_print(
         "VisionPruner config: "
-        f"decoder_layer_idx={model.config.vision_pruner_decoder_layer_idx}, "
-        f"train_mode={model.config.vision_pruner_train_mode}, "
-        f"init_mode={model.config.vision_pruner_init_mode}, "
-        f"preserve_components={model.config.vision_pruner_preserve_components}, "
-        f"freeze_components={model.config.vision_pruner_freeze_components}, "
-        f"score_noise_distribution=normal(mean=0,std={model.config.vision_pruner_score_noise_std:.6f}, "
-        f"variance={model.config.vision_pruner_score_noise_std ** 2:.6f}, "
-        f"tail_threshold={model.config.vision_pruner_score_noise_tail_threshold:.1f}), "
-        f"sparse_loss_weights=image:{model.config.vision_pruner_image_sparse_loss_weight:.1f},"
-        f"text:{model.config.vision_pruner_text_sparse_loss_weight:.1f}, "
+        f"value_layer_idx={model.config.vision_pruner_value_layer_idx}, "
+        f"context_layer_idx={model.config.vision_pruner_context_layer_idx}, "
+        f"tau={model.config.vision_pruner_tau:.2f}, "
+        f"rho={model.config.vision_pruner_rho:.2f}, "
+        f"lambda_sparse={model.config.vision_pruner_lambda_sparse:.1f}, "
         f"attention_pre_prune_keep_ratio={model.config.vision_pruner_attention_pre_prune_keep_ratio:.2f}, "
         f"attention_pre_prune_layer={model.config.vision_pruner_attention_pre_prune_layer}, "
         f"attention_pre_prune_head_reduction={model.config.vision_pruner_attention_pre_prune_head_reduction}, "
-        "train_prunes_question_text_tokens=True, "
+        "train_prunes_question_text_tokens=False, "
         f"max_param_abs={model.config.vision_pruner_max_param_abs}, "
-        "pruning_uses_fixed_TAU_RHO, "
+        "trainable_modules=text_q_proj,image_k_proj, "
         "trainable_dtype=float32"
     )
 

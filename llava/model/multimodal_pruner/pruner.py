@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import inspect
 import os
 import torch
 import torch.nn as nn
@@ -8,15 +9,67 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 
 
 class LlavaImagePruner(nn.Module):
-    def __init__(self, llava_decoder_layer):
+    def __init__(self, value_layer, context_layer, rotary_emb=None):
         super().__init__()
-        self.layer = copy.deepcopy(llava_decoder_layer)
+        value_attn = value_layer.self_attn
+        context_attn = context_layer.self_attn
+
+        self.value_layernorm = copy.deepcopy(value_layer.input_layernorm)
+        self.value_v_proj = copy.deepcopy(value_attn.v_proj)
+        self.value_o_proj = copy.deepcopy(value_attn.o_proj)
+        self.rotary_emb = copy.deepcopy(
+            rotary_emb if rotary_emb is not None else getattr(value_attn, "rotary_emb", None)
+        )
+        self.context_layer = copy.deepcopy(context_layer)
+        self.text_q_proj = copy.deepcopy(context_attn.q_proj)
+        self.image_k_proj = copy.deepcopy(context_attn.k_proj)
         self.verbose = os.environ.get("LLAVA_VISION_PRUNER_VERBOSE", "1") == "1"
-        self.score_noise_std = 0.0
-        self.score_noise_variance = 0.0
-        self.score_noise_tail_threshold = 0.1
-        self.score_noise_last_std = 0.0
-        self.score_noise_last_abs_ge_threshold_ratio = 0.0
+
+        config = getattr(context_attn, "config", None)
+        hidden_size = getattr(config, "hidden_size", context_attn.q_proj.in_features)
+        self.num_attention_heads = int(
+            getattr(
+                context_attn,
+                "num_heads",
+                getattr(config, "num_attention_heads", 1),
+            )
+        )
+        self.num_key_value_heads = int(
+            getattr(
+                context_attn,
+                "num_key_value_heads",
+                getattr(config, "num_key_value_heads", self.num_attention_heads),
+            )
+        )
+        self.head_dim = int(
+            getattr(
+                context_attn,
+                "head_dim",
+                context_attn.q_proj.out_features // max(1, self.num_attention_heads),
+            )
+        )
+        self.num_key_value_groups = max(1, self.num_attention_heads // max(1, self.num_key_value_heads))
+        self.hidden_size = int(hidden_size)
+
+        self._freeze_fixed_modules()
+
+    def _freeze_fixed_modules(self):
+        for module in (
+            self.value_layernorm,
+            self.value_v_proj,
+            self.value_o_proj,
+            self.rotary_emb,
+            self.context_layer,
+        ):
+            if module is None:
+                continue
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+        for param in self.text_q_proj.parameters():
+            param.requires_grad_(True)
+        for param in self.image_k_proj.parameters():
+            param.requires_grad_(True)
 
     @staticmethod
     def _stable_l2_normalize(tensor: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -25,6 +78,133 @@ class LlavaImagePruner(nn.Module):
         scaled = tensor / scale
         inv_norm = torch.rsqrt(scaled.pow(2).sum(dim=dim, keepdim=True).clamp_min(eps * eps))
         return scaled * inv_norm
+
+    @staticmethod
+    def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:
+        first_half = tensor[..., : tensor.shape[-1] // 2]
+        second_half = tensor[..., tensor.shape[-1] // 2 :]
+        return torch.cat((-second_half, first_half), dim=-1)
+
+    @staticmethod
+    def _layer_output_hidden_states(outputs):
+        if isinstance(outputs, tuple):
+            return outputs[0]
+        return outputs
+
+    def _build_position_ids(
+        self,
+        attention_mask_2d: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        if position_ids is not None:
+            return position_ids
+        return torch.arange(seq_len, device=attention_mask_2d.device, dtype=torch.long).unsqueeze(0).expand(
+            attention_mask_2d.shape[0],
+            -1,
+        )
+
+    def _build_attention_mask_4d(
+        self,
+        attention_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        past_key_value: tuple = None,
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            return None
+        if attention_mask.dim() != 2:
+            return attention_mask.float()
+        return _prepare_4d_causal_attention_mask(
+            attention_mask,
+            (hidden_states.shape[0], hidden_states.shape[1]),
+            hidden_states,
+            past_key_value[0].shape[-2] if past_key_value is not None else 0,
+        )
+
+    def _value_path(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.to(dtype=self.value_v_proj.weight.dtype)
+        normalized = self.value_layernorm(hidden_states)
+        value_states = self.value_v_proj(normalized)
+        value_states = value_states.view(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            self.num_key_value_heads,
+            self.head_dim,
+        ).transpose(1, 2)
+        value_states = self._repeat_kv(value_states)
+        value_states = value_states.transpose(1, 2).contiguous().view(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            self.num_attention_heads * self.head_dim,
+        )
+        return self.value_o_proj(value_states)
+
+    def _repeat_kv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.num_key_value_groups == 1:
+            return hidden_states
+        batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch,
+            num_key_value_heads,
+            self.num_key_value_groups,
+            seq_len,
+            head_dim,
+        )
+        return hidden_states.reshape(batch, num_key_value_heads * self.num_key_value_groups, seq_len, head_dim)
+
+    def _run_context_layer(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask_4d: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_value: tuple = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        forward_params = inspect.signature(self.context_layer.forward).parameters
+        layer_kwargs = {
+            "hidden_states": hidden_states,
+            "attention_mask": attention_mask_4d,
+            "position_ids": position_ids,
+        }
+
+        if "past_key_values" in forward_params:
+            layer_kwargs["past_key_values"] = past_key_value
+        elif "past_key_value" in forward_params:
+            layer_kwargs["past_key_value"] = past_key_value
+        if "output_attentions" in forward_params:
+            layer_kwargs["output_attentions"] = output_attentions
+        if "use_cache" in forward_params:
+            layer_kwargs["use_cache"] = use_cache
+        if "position_embeddings" in forward_params and self.rotary_emb is not None:
+            layer_kwargs["position_embeddings"] = self.rotary_emb(hidden_states, position_ids)
+
+        for key, value in kwargs.items():
+            if key in forward_params:
+                layer_kwargs[key] = value
+
+        outputs = self.context_layer(**layer_kwargs)
+        return self._layer_output_hidden_states(outputs)
+
+    def _apply_rotary(self, states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if self.rotary_emb is None:
+            return states
+        cos, sin = self.rotary_emb(states, positions)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        return (states * cos) + (self._rotate_half(states) * sin)
+
+    def _project_query(self, token_states: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        query = self.text_q_proj(token_states)
+        query = query.view(1, 1, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        return self._apply_rotary(query, token_positions)
+
+    def _project_keys(self, token_states: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        keys = self.image_k_proj(token_states)
+        keys = keys.view(1, token_states.shape[1], self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        keys = self._apply_rotary(keys, token_positions)
+        return self._repeat_kv(keys)
 
     def forward(
         self,
@@ -46,122 +226,64 @@ class LlavaImagePruner(nn.Module):
             )
         else:
             attention_mask_2d = attention_mask.clone()
-        if attention_mask is not None and attention_mask.dim() == 2:
-            attention_mask_4d = _prepare_4d_causal_attention_mask(
-                attention_mask,
-                (hidden_states.shape[0], hidden_states.shape[1]),
-                hidden_states,
-                past_key_value[0].shape[-2] if past_key_value is not None else 0,
-            )
-        else:
-            attention_mask_4d = attention_mask.float() if attention_mask is not None else None
+        position_ids = self._build_position_ids(attention_mask_2d, position_ids, hidden_states.shape[1])
+        attention_mask_4d = self._build_attention_mask_4d(attention_mask, hidden_states, past_key_value)
 
-        # self.layer 통과하여 outputs 구하기 (fp32 연산)
-        outputs = self.layer(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask_4d,
+        value_states = self._value_path(hidden_states)
+        layer_output_states = self._run_context_layer(
+            hidden_states=value_states,
+            attention_mask_4d=attention_mask_4d,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
-            **kwargs
+            **kwargs,
         )
-        
-        layer_output_states = outputs[0] # [batch_size, expanded_seq_len, hidden_size]
 
         batch_size = layer_output_states.shape[0]
         seq_len = layer_output_states.shape[1]
-        hidden_size = layer_output_states.shape[-1]
 
-        # 스코어 계산을 위한 "마지막 토큰" 구하기
         if labels is not None:
-            # [훈련 단계] Prompt의 마지막 토큰 찾기
-            # Prompt는 labels에서 IGNORE_INDEX(-100)로 마스킹되어 있으므로, 
-            # 첫 번째 유효 레이블 바로 이전의 토큰을 Prompt의 마지막 토큰으로 간주함.
             last_token_indices = []
             for b in range(batch_size):
                 valid_idx = torch.where(labels[b] != IGNORE_INDEX)[0]
                 if len(valid_idx) > 0:
-                    # 답변이 시작되기 직전의 토큰 (일반적으로 'Assistant:' 토큰)
                     idx = valid_idx[0].item() - 1
                     last_token_indices.append(max(0, idx))
                 else:
-                    # 만약 유효한 레이블이 없다면(에러 상황 등), 패딩을 고려한 시퀀스 끝 사용
                     idx = attention_mask_2d[b].cumsum(dim=0).argmax().item()
                     last_token_indices.append(idx)
             last_token_indices = torch.tensor(last_token_indices, device=layer_output_states.device)
         else:
-            # [추론 단계] 현재 입력 시퀀스의 마지막 토큰 찾기
-            # 패딩을 고려하여 실제 마지막 토큰의 위치를 찾음
             last_token_indices = attention_mask_2d.cumsum(dim=1).argmax(dim=1)
         
-        last_token_output = layer_output_states[torch.arange(batch_size), last_token_indices].unsqueeze(1)
-        
         image_scores_list = []
-        text_scores_list = []
-        score_noise_samples = []
         
-        # 배치 내 각 아이템별로 처리
         for b in range(batch_size):
             ranges = batch_image_ranges[b] if batch_image_ranges is not None else []
-            last_token_b = last_token_output[b:b+1, :, :] # [1, 1, hidden_size]
-
-            def compute_scores(target_tokens):
-                query = self._stable_l2_normalize(last_token_b, dim=-1, eps=1e-6)
-                keys = self._stable_l2_normalize(target_tokens, dim=-1, eps=1e-6)
-                scores = torch.matmul(query, keys.transpose(-1, -2)).squeeze(1)
-                scores = scores.clamp(min=-1.0, max=1.0)
-
-                if self.training:
-                    score_noise_std = float(getattr(self, "score_noise_std", 0.0) or 0.0)
-                    if score_noise_std > 0.0:
-                        noise = torch.randn_like(scores) * score_noise_std
-                        scores = scores + noise
-                        scores = scores.clamp(min=-1.0, max=1.0)
-                        score_noise_samples.append(noise.detach().float().reshape(-1))
-                return scores
-
             if len(ranges) == 0:
-                # 이미지가 없는 예외 상황의 경우 빈 스코어 생성
-                empty_score = torch.empty((1, 0), device=hidden_states.device)
-                image_scores_list.append(empty_score)
-            else:
-                # 해당 배치 아이템의 모든 이미지 패치 추출 및 병합: [1, total_image_tokens, hidden_size]
-                # fp32로 캐스팅된 hidden_states 사용 (last_token_b와 dtype 일치)
-                image_tokens_target = torch.cat(
-                    [hidden_states[b:b+1, s:e, :] for s, e in ranges], dim=1
-                )
-                image_scores_list.append(compute_scores(image_tokens_target))
+                image_scores_list.append(torch.empty((1, 0), device=hidden_states.device, dtype=torch.float32))
+                continue
 
-            if batch_text_indices is None:
-                text_indices = torch.empty(0, device=hidden_states.device, dtype=torch.long)
-            else:
-                text_indices = batch_text_indices[b].to(device=hidden_states.device, dtype=torch.long)
-                if text_indices.numel() > 0:
-                    text_indices = text_indices[(text_indices >= 0) & (text_indices < seq_len)]
-                if text_indices.numel() > 0:
-                    text_indices = text_indices[attention_mask_2d[b, text_indices].bool()]
+            all_img_indices = torch.cat([
+                torch.arange(start, end, device=hidden_states.device) for start, end in ranges
+            ])
+            all_img_indices = all_img_indices[(all_img_indices >= 0) & (all_img_indices < seq_len)]
+            if all_img_indices.numel() == 0:
+                image_scores_list.append(torch.empty((1, 0), device=hidden_states.device, dtype=torch.float32))
+                continue
 
-            if text_indices.numel() == 0:
-                text_scores_list.append(torch.empty((1, 0), device=hidden_states.device))
-            else:
-                text_tokens_target = hidden_states[b:b+1, text_indices, :]
-                text_scores_list.append(compute_scores(text_tokens_target))
+            query_index = last_token_indices[b].view(1, 1)
+            query_states = layer_output_states[b:b+1, query_index.squeeze(0), :]
+            image_states = layer_output_states[b:b+1, all_img_indices, :]
 
-        score_noise_std = float(getattr(self, "score_noise_std", 0.0) or 0.0)
-        score_noise_tail_threshold = float(getattr(self, "score_noise_tail_threshold", 0.1) or 0.1)
-        self.score_noise_variance = score_noise_std ** 2
-        if score_noise_samples:
-            noise_samples = torch.cat(score_noise_samples)
-            self.score_noise_last_std = noise_samples.std(unbiased=False).item()
-            self.score_noise_last_abs_ge_threshold_ratio = (
-                noise_samples.abs() >= score_noise_tail_threshold
-            ).float().mean().item()
-        elif self.training:
-            self.score_noise_last_std = 0.0
-            self.score_noise_last_abs_ge_threshold_ratio = 0.0
+            query = self._project_query(query_states, position_ids[b:b+1, query_index.squeeze(0)])
+            keys = self._project_keys(image_states, position_ids[b:b+1, all_img_indices])
+            query = self._stable_l2_normalize(query, dim=-1, eps=1e-6)
+            keys = self._stable_l2_normalize(keys, dim=-1, eps=1e-6)
+            scores = (query * keys).sum(dim=-1).mean(dim=1).clamp(min=-1.0, max=1.0)
+            image_scores_list.append(scores)
         
-        # 스코어가 잘 나오고 있는지 출력
         if self.verbose:
             for b, s in enumerate(image_scores_list):
                 scores = s.squeeze(0)
@@ -177,25 +299,8 @@ class LlavaImagePruner(nn.Module):
                 print(f"scores : {scores[topk_idx]}")
                 print(f"         score range: min={scores.min().item():.4f}, max={scores.max().item():.4f}")
                 print(f"         scores >= {score_cutoff}: {(scores >= score_cutoff).sum().item()} / {n}")
-            for b, s in enumerate(text_scores_list):
-                scores = s.squeeze(0)
-                n = scores.shape[0]
-                if n == 0:
-                    print(f"[batch {b}] question text tokens: 0")
-                    continue
-                k = max(1, int(n * 0.1))
-                topk_idx = torch.topk(scores, k=k).indices
-                score_cutoff = 0.0
-                print(f"[batch {b}] question text tokens: {n}, top 10% ({k}) indices: {topk_idx.tolist()}")
-                print(f"scores : {scores[topk_idx]}")
-                print(f"         score range: min={scores.min().item():.4f}, max={scores.max().item():.4f}")
-                print(f"         scores >= {score_cutoff}: {(scores >= score_cutoff).sum().item()} / {n}")
 
-        # q_proj의 가중치를 간략 출력
-        # target_layer = self.layer.self_attn.q_proj.weight
-        # print("self_attn.q_proj.weight", target_layer[:5, :5])
-
-        return {"image": image_scores_list, "text": text_scores_list}
+        return {"image": image_scores_list}
 
 
 def get_image_and_text_token_indices(input_ids,
@@ -614,24 +719,21 @@ def prune_tokens_for_training(
         M_i = 1  if S_i > TAU,  else 0
         M_ste_i = S_i + stop_grad(M_i − S_i)   ← forward: M_i, backward: S_i
 
-    Returns image/text ste mask tensors so the caller can compute separate sparsity losses:
-        L_sparse_* = (mean(M_ste_*) − ρ)²
+    Returns selected and complement image-token masks for the task and contrastive losses.
     """
     batch_size = inputs_embeds.shape[0]
     device = inputs_embeds.device
 
     # Keep the STE mask in fp32 because cosine scores are fp32 even when embeddings are bf16.
-    diff_mask = torch.ones((batch_size, inputs_embeds.shape[1]), device=device, dtype=torch.float32)
+    selected_mask = torch.ones((batch_size, inputs_embeds.shape[1]), device=device, dtype=torch.float32)
+    unselected_mask = torch.ones((batch_size, inputs_embeds.shape[1]), device=device, dtype=torch.float32)
 
     if isinstance(scores, dict):
         image_scores_list = scores.get("image", [])
-        text_scores_list = scores.get("text", [])
     else:
         image_scores_list = scores
-        text_scores_list = []
 
     all_image_ste_masks = []
-    all_text_ste_masks = []
 
     def build_ste_mask(score_tensor):
         M = (score_tensor > tau).to(score_tensor.dtype)
@@ -640,55 +742,55 @@ def prune_tokens_for_training(
     for b in range(batch_size):
         image_scores = image_scores_list[b].squeeze(0)  # [total_image_tokens]
         num_img_tokens = image_scores.shape[0]
-        if num_img_tokens == 0:
-            pass
-        else:
-            # STE: numerically equals the hard binary mask in forward, but gradient flows through scores.
-            image_M_ste = build_ste_mask(image_scores)
-            all_image_ste_masks.append(image_M_ste)
+        ranges = batch_image_ranges[b] if batch_image_ranges is not None else []
+        if num_img_tokens == 0 or not ranges:
+            continue
 
-            ranges = batch_image_ranges[b]
-            all_img_indices = torch.cat([
-                torch.arange(start, end, device=device) for start, end in ranges
-            ])
-            diff_mask[b, all_img_indices] = image_M_ste
+        all_img_indices = torch.cat([
+            torch.arange(start, end, device=device) for start, end in ranges
+        ])
+        token_count = min(num_img_tokens, all_img_indices.numel())
+        if token_count == 0:
+            continue
 
-        if text_scores_list:
-            text_scores = text_scores_list[b].squeeze(0)
-            text_indices = batch_text_indices[b].to(device=device, dtype=torch.long)
-            if text_scores.numel() > 0 and text_indices.numel() > 0:
-                token_count = min(text_scores.numel(), text_indices.numel())
-                text_scores = text_scores[:token_count]
-                text_indices = text_indices[:token_count]
-                text_M_ste = build_ste_mask(text_scores)
-                all_text_ste_masks.append(text_M_ste)
-                diff_mask[b, text_indices] = text_M_ste
+        image_scores = image_scores[:token_count]
+        all_img_indices = all_img_indices[:token_count]
+        image_M_ste = build_ste_mask(image_scores)
+        unselected_M_ste = (1.0 - image_scores) + ((1.0 - image_M_ste) - (1.0 - image_scores)).detach()
+        all_image_ste_masks.append(image_M_ste)
 
-    # Flat tensors of all M_ste values — used by the caller for separate L_sparse terms.
+        selected_mask[b, all_img_indices] = image_M_ste
+        unselected_mask[b, all_img_indices] = unselected_M_ste
+
     image_ste_masks_flat = (
         torch.cat(all_image_ste_masks) if all_image_ste_masks else inputs_embeds.new_empty(0)
     )
-    text_ste_masks_flat = (
-        torch.cat(all_text_ste_masks) if all_text_ste_masks else inputs_embeds.new_empty(0)
-    )
 
-    # Differentiable mask: pruned image/question-text tokens become zero vectors.
+    # Differentiable masks: pruned image tokens become zero vectors.
     # Cast only at the multiplication boundary so the downstream model keeps its input dtype.
-    final_embeds = inputs_embeds * diff_mask.to(inputs_embeds.dtype).unsqueeze(-1)
+    selected_embeds = inputs_embeds * selected_mask.to(inputs_embeds.dtype).unsqueeze(-1)
+    unselected_embeds = inputs_embeds * unselected_mask.to(inputs_embeds.dtype).unsqueeze(-1)
 
-    # Attention mask: exclude pruned tokens from attention
     if attention_mask is not None:
-        final_masks = attention_mask * diff_mask.to(attention_mask.dtype)
+        selected_attention_mask = attention_mask * selected_mask.to(attention_mask.dtype)
+        unselected_attention_mask = attention_mask * unselected_mask.to(attention_mask.dtype)
     else:
-        final_masks = None
+        selected_attention_mask = None
+        unselected_attention_mask = None
 
-    # Labels: ignore pruned positions in the task loss
-    final_labels = labels.clone() if labels is not None else None
-    if final_labels is not None:
-        # diff_mask is numerically 0 or 1 in the forward pass (STE property)
-        final_labels[diff_mask.detach() == 0] = IGNORE_INDEX
+    selected_labels = labels.clone() if labels is not None else None
+    unselected_labels = labels.clone() if labels is not None else None
 
-    return final_embeds, final_labels, final_masks, position_ids, image_ste_masks_flat, text_ste_masks_flat
+    return (
+        selected_embeds,
+        selected_labels,
+        selected_attention_mask,
+        position_ids,
+        unselected_embeds,
+        unselected_labels,
+        unselected_attention_mask,
+        image_ste_masks_flat,
+    )
 
 def prune_tokens_for_inference(
     scores,
@@ -696,11 +798,13 @@ def prune_tokens_for_inference(
     inputs_embeds,
     attention_mask,
     position_ids,
-    top_p=0.05,
+    top_p=None,
     image_keep_counts=None,
     batch_text_indices=None,
     text_top_p=None,
     image_token_indices=None,
+    tau=0.0,
+    selection_mode="threshold",
 ):
     batch_size = inputs_embeds.shape[0]
     device = inputs_embeds.device
@@ -712,10 +816,8 @@ def prune_tokens_for_inference(
 
     if isinstance(scores, dict):
         image_scores_list = scores.get("image", [])
-        text_scores_list = scores.get("text", [])
     else:
         image_scores_list = scores
-        text_scores_list = []
 
     new_embeds_list = []
     new_masks_list = []   # attention_mask가 None이면 사용하지 않음
@@ -728,28 +830,53 @@ def prune_tokens_for_inference(
         image_scores = image_scores_list[b].squeeze(0) # [total_image_tokens]
         num_img_tokens = image_scores.shape[0]
         if num_img_tokens > 0:
-            if image_keep_counts is not None and b < len(image_keep_counts):
-                k = max(1, min(num_img_tokens, int(image_keep_counts[b])))
-            else:
-                k = _get_keep_count(num_img_tokens, top_p)
-            topk_indices = torch.topk(image_scores, k=k).indices
-            topk_indices, _ = torch.sort(topk_indices)
-
-            ranges = batch_image_ranges[b]
+            ranges = batch_image_ranges[b] if batch_image_ranges is not None else []
+            if not ranges:
+                final_indices = torch.where(keep_mask)[0]
+                new_embeds_list.append(inputs_embeds[b, final_indices])
+                if attention_mask is not None:
+                    new_masks_list.append(attention_mask[b, final_indices])
+                if position_ids is not None:
+                    new_pos_ids_list.append(position_ids[b, final_indices])
+                continue
             all_img_indices = torch.cat([
                 torch.arange(start, end, device=device) for start, end in ranges
             ])
-            selected_img_indices = all_img_indices[topk_indices]
+            token_count = min(num_img_tokens, all_img_indices.numel())
+            if token_count == 0:
+                final_indices = torch.where(keep_mask)[0]
+                new_embeds_list.append(inputs_embeds[b, final_indices])
+                if attention_mask is not None:
+                    new_masks_list.append(attention_mask[b, final_indices])
+                if position_ids is not None:
+                    new_pos_ids_list.append(position_ids[b, final_indices])
+                continue
+            image_scores = image_scores[:token_count]
+            all_img_indices = all_img_indices[:token_count]
+
+            if selection_mode == "topk":
+                if image_keep_counts is not None and b < len(image_keep_counts):
+                    k = max(1, min(token_count, int(image_keep_counts[b])))
+                else:
+                    keep_ratio = 1.0 if top_p is None else float(top_p)
+                    k = _get_keep_count(token_count, keep_ratio)
+                selected_local_indices = torch.topk(image_scores, k=k).indices
+                selected_local_indices, _ = torch.sort(selected_local_indices)
+            else:
+                selected_local_indices = torch.where(image_scores > tau)[0]
+                k = int(selected_local_indices.numel())
+
+            selected_img_indices = all_img_indices[selected_local_indices]
 
             if trace_topk and prune_tokens_for_inference._trace_count < trace_limit:
-                selected_scores = image_scores[topk_indices]
-                score_std = image_scores.float().std(unbiased=False).item() if num_img_tokens > 1 else 0.0
+                selected_scores = image_scores[selected_local_indices]
+                score_std = image_scores.float().std(unbiased=False).item() if token_count > 1 else 0.0
                 original_local_indices = None
                 token_index_map = None
                 if image_token_indices is not None and b < len(image_token_indices):
                     token_index_map = image_token_indices[b].to(device=device, dtype=torch.long)
-                    if token_index_map.numel() >= num_img_tokens:
-                        original_local_indices = token_index_map[:num_img_tokens][topk_indices]
+                    if token_index_map.numel() >= token_count and selected_local_indices.numel() > 0:
+                        original_local_indices = token_index_map[:token_count][selected_local_indices]
                 original_index_trace = ""
                 if original_local_indices is not None and token_index_map is not None:
                     original_index_trace = (
@@ -764,39 +891,25 @@ def prune_tokens_for_inference(
                             f"selected_orig_local={original_local_indices.tolist()}"
                         )
                 print(
-                    "[VisionPruner topk] "
+                    "[VisionPruner select] "
                     f"sample={prune_tokens_for_inference._trace_count} batch={b} "
-                    f"image_tokens={num_img_tokens} keep={k} keep_ratio={float(top_p):.6f} "
-                    f"rel_sha={_digest_indices(topk_indices)} "
+                    f"mode={selection_mode} image_tokens={token_count} keep={k} tau={float(tau):.6f} "
+                    f"rel_sha={_digest_indices(selected_local_indices)} "
                     f"abs_seq_sha={_digest_indices(selected_img_indices)} "
                     f"score_min={image_scores.min().item():.6f} "
                     f"score_max={image_scores.max().item():.6f} "
                     f"score_mean={image_scores.float().mean().item():.6f} "
                     f"score_std={score_std:.6f} "
-                    f"selected_score_min={selected_scores.min().item():.6f} "
-                    f"selected_score_max={selected_scores.max().item():.6f} "
-                    f"first10_rel={topk_indices[:10].tolist()}"
+                    f"selected_score_min={(selected_scores.min().item() if selected_scores.numel() > 0 else float('nan')):.6f} "
+                    f"selected_score_max={(selected_scores.max().item() if selected_scores.numel() > 0 else float('nan')):.6f} "
+                    f"first10_rel={selected_local_indices[:10].tolist()}"
                     f"{original_index_trace}"
                 )
                 prune_tokens_for_inference._trace_count += 1
 
             keep_mask[all_img_indices] = False
-            keep_mask[selected_img_indices] = True
-
-        if text_top_p is not None and text_scores_list and batch_text_indices is not None:
-            text_scores = text_scores_list[b].squeeze(0)
-            text_indices = batch_text_indices[b].to(device=device, dtype=torch.long)
-            if text_scores.numel() > 0 and text_indices.numel() > 0:
-                token_count = min(text_scores.numel(), text_indices.numel())
-                text_scores = text_scores[:token_count]
-                text_indices = text_indices[:token_count]
-                k = _get_keep_count(token_count, text_top_p)
-                topk_indices = torch.topk(text_scores, k=k).indices
-                topk_indices, _ = torch.sort(topk_indices)
-                selected_text_indices = text_indices[topk_indices]
-
-                keep_mask[text_indices] = False
-                keep_mask[selected_text_indices] = True
+            if selected_img_indices.numel() > 0:
+                keep_mask[selected_img_indices] = True
 
         final_indices = torch.where(keep_mask)[0]
 

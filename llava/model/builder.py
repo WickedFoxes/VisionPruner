@@ -23,7 +23,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAn
 import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava_lp.model.language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM
+from llava.model.language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM
 
 
 VISION_PRUNER_WEIGHT_NAME = 'vision_pruner.bin'
@@ -63,6 +63,7 @@ def _has_vision_pruner_metadata(model_path):
     return (
         _has_vision_pruner_weights(model_path)
         or config.get('model_type') == 'llava_llama_with_vision_pruner'
+        or 'vision_pruner_value_layer_idx' in config
         or 'vision_pruner_decoder_layer_idx' in config
     )
 
@@ -302,12 +303,12 @@ def load_pretrained_model_with_VisionPruner(model_path, model_base, model_name, 
 
     # model 불러오기
     if is_llava_model:
-        from llava_lp.model.language_model.llava_llama import LlavaLlamaForCausalLM_with_VisionPruner
+        from llava.model.language_model.llava_llama import LlavaLlamaForCausalLM_with_VisionPruner
         # Load LLaVA model
         if 'lora' in model_name.lower() and model_base is None:
             warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
         if 'lora' in model_name.lower() and model_base is not None:
-            from llava_lp.model.language_model.llava_llama import LlavaConfig
+            from llava.model.language_model.llava_llama import LlavaConfig
             lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             print('Loading LLaVA from base model...')
@@ -383,10 +384,23 @@ def load_pretrained_model_with_VisionPruner(model_path, model_base, model_name, 
         # Older checkpoints may contain vision_pruner.bin without the config key,
         # so the file itself is also treated as a signal that the pruner exists.
         vision_pruner_bin = os.path.join(model_path, VISION_PRUNER_WEIGHT_NAME)
-        if hasattr(model.config, 'vision_pruner_decoder_layer_idx') or os.path.exists(vision_pruner_bin):
-            idx = getattr(model.config, 'vision_pruner_decoder_layer_idx', 0)
+        if (
+            hasattr(model.config, 'vision_pruner_value_layer_idx')
+            or hasattr(model.config, 'vision_pruner_decoder_layer_idx')
+            or os.path.exists(vision_pruner_bin)
+        ):
+            value_idx = getattr(
+                model.config,
+                'vision_pruner_value_layer_idx',
+                getattr(model.config, 'vision_pruner_decoder_layer_idx', 0),
+            )
+            context_idx = getattr(model.config, 'vision_pruner_context_layer_idx', 9)
             if model.get_model().get_vision_pruner() is None:
-                model.get_model().initialize_vision_pruner(model.model.layers[idx])
+                model.get_model().initialize_vision_pruner(
+                    model.model.layers[value_idx],
+                    model.model.layers[context_idx],
+                    rotary_emb=getattr(model.model, 'rotary_emb', None),
+                )
             if os.path.exists(vision_pruner_bin):
                 _load_vision_pruner_weights(model, vision_pruner_bin)
     else:

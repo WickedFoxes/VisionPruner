@@ -50,8 +50,13 @@ class LlavaConfig_with_VisionPruner(LlavaConfig):
     def __init__(
         self,
         *args,
-        vision_pruner_decoder_layer_idx: int = 0,
-        vision_pruner_attention_pre_prune_keep_ratio: float = 0.50,
+        vision_pruner_value_layer_idx: int = 0,
+        vision_pruner_context_layer_idx: int = 9,
+        vision_pruner_decoder_layer_idx: Optional[int] = None,
+        vision_pruner_tau: float = 0.0,
+        vision_pruner_rho: float = 0.1,
+        vision_pruner_lambda_sparse: float = 1.0,
+        vision_pruner_attention_pre_prune_keep_ratio: float = 1.0,
         vision_pruner_attention_pre_prune_layer: Optional[int] = None,
         vision_pruner_attention_pre_prune_head_reduction: str = "mean",
         **kwargs,
@@ -59,7 +64,14 @@ class LlavaConfig_with_VisionPruner(LlavaConfig):
         # Older checkpoints may contain this key. TAU/RHO are fixed code constants now.
         kwargs.pop("vision_pruner_threshold", None)
         super().__init__(*args, **kwargs)
-        self.vision_pruner_decoder_layer_idx = vision_pruner_decoder_layer_idx
+        if vision_pruner_decoder_layer_idx is not None:
+            vision_pruner_value_layer_idx = vision_pruner_decoder_layer_idx
+        self.vision_pruner_value_layer_idx = vision_pruner_value_layer_idx
+        self.vision_pruner_context_layer_idx = vision_pruner_context_layer_idx
+        self.vision_pruner_decoder_layer_idx = vision_pruner_value_layer_idx
+        self.vision_pruner_tau = vision_pruner_tau
+        self.vision_pruner_rho = vision_pruner_rho
+        self.vision_pruner_lambda_sparse = vision_pruner_lambda_sparse
         self.vision_pruner_attention_pre_prune_keep_ratio = vision_pruner_attention_pre_prune_keep_ratio
         self.vision_pruner_attention_pre_prune_layer = vision_pruner_attention_pre_prune_layer
         self.vision_pruner_attention_pre_prune_head_reduction = vision_pruner_attention_pre_prune_head_reduction
@@ -218,10 +230,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 # L_sparse = (mean(M_ste) - RHO)^2
 LAMBDA_SPARSE: float = 1.0   # weight of the sparsity term
 TAU: float = 0.0             # score cutoff (0.0 이하이면 마스킹)
-RHO: float = 0.05            # target keep-rate (최소한 5%는 0.0 이상이 되도록 학습)
-IMAGE_SPARSE_LOSS_WEIGHT: float = 0.5
-TEXT_SPARSE_LOSS_WEIGHT: float = 0.5
-VISION_PRUNER_ATTENTION_PRE_PRUNE_KEEP_RATIO: float = 0.50
+RHO: float = 0.1             # target image-token keep-rate
+VISION_PRUNER_ATTENTION_PRE_PRUNE_KEEP_RATIO: float = 1.0
 VISION_PRUNER_ATTENTION_PRE_PRUNE_HEAD_REDUCTION: str = "mean"
 
 
@@ -374,12 +384,13 @@ class LlavaLlamaForCausalLM_with_VisionPruner(LlamaForCausalLM, LlavaMetaForCaus
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         image_ste_masks_flat = None  # image-token M_ste values collected for L_sparse
-        text_ste_masks_flat = None   # question-text-token M_ste values collected for L_sparse
+        unselected_inputs_embeds = None
+        unselected_labels = None
+        unselected_attention_mask = None
 
         if inputs_embeds is None:
             orig_input_ids = input_ids.clone()
             orig_attention_mask = attention_mask.clone() if attention_mask is not None else None
-            orig_text_prune_mask = text_prune_mask.clone() if text_prune_mask is not None else None
             (
                 input_ids,
                 position_ids,
@@ -405,7 +416,6 @@ class LlavaLlamaForCausalLM_with_VisionPruner(LlamaForCausalLM, LlavaMetaForCaus
                     orig_attention_mask=orig_attention_mask,
                     exp_attention_mask=attention_mask,
                     labels=labels,
-                    text_prune_mask=orig_text_prune_mask,
                 )
                 image_slot_counts = get_image_slot_counts(
                     orig_input_ids,
@@ -429,27 +439,23 @@ class LlavaLlamaForCausalLM_with_VisionPruner(LlamaForCausalLM, LlavaMetaForCaus
                     image_slot_counts=image_slot_counts,
                 )
 
-                # 1. 이미지 토큰 score와 질문 텍스트 토큰 score를 따로 계산
                 scores = image_pruner(
                     input_ids=orig_input_ids,
                     hidden_states=inputs_embeds.detach(),
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     batch_image_ranges=batch_image_ranges,
-                    batch_text_indices=batch_text_indices,
                     labels=labels,
                 )
-                # 2. 이미지/질문 텍스트 토큰 모두 STE 마스킹 (fixed TAU 기반)
-                #    M_i = 1 if S_i > τ else 0
-                #    M_ste_i = S_i + stop_grad(M_i − S_i)
-                #    *_ste_masks_flat: L_sparse 계산을 위해 반환된 M_ste 값
                 (
                     inputs_embeds,
                     labels,
                     attention_mask,
                     position_ids,
+                    unselected_inputs_embeds,
+                    unselected_labels,
+                    unselected_attention_mask,
                     image_ste_masks_flat,
-                    text_ste_masks_flat,
                 ) = prune_tokens_for_training(
                     scores,
                     batch_image_ranges,
@@ -458,7 +464,7 @@ class LlavaLlamaForCausalLM_with_VisionPruner(LlamaForCausalLM, LlavaMetaForCaus
                     labels,
                     attention_mask,
                     position_ids,
-                    tau=TAU
+                    tau=getattr(self.config, "vision_pruner_tau", TAU),
                 )
 
         outputs = super().forward(
@@ -471,39 +477,47 @@ class LlavaLlamaForCausalLM_with_VisionPruner(LlamaForCausalLM, LlavaMetaForCaus
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict
+            return_dict=True
         )
 
-        # 3. Sparsity loss 계산 및 합산
-        #    L_sparse_img/text = (mean(M_ste) − rho)²
-        #    L_sparse = 0.5 * L_sparse_img + 0.5 * L_sparse_text
-        #    L_total  = L_task + λ_sparse * L_sparse   [λ_sparse = 1]
         has_image_sparse = image_ste_masks_flat is not None and image_ste_masks_flat.numel() > 0
-        has_text_sparse = text_ste_masks_flat is not None and text_ste_masks_flat.numel() > 0
-        if outputs.loss is not None and (has_image_sparse or has_text_sparse):
-            l_task = outputs.loss
-            l_sparse_image = (
-                (image_ste_masks_flat.mean() - RHO) ** 2
-                if has_image_sparse
-                else l_task.new_zeros(())
-            )
-            l_sparse_text = (
-                (text_ste_masks_flat.mean() - RHO) ** 2
-                if has_text_sparse
-                else l_task.new_zeros(())
-            )
-            weighted_l_sparse = LAMBDA_SPARSE * (
-                IMAGE_SPARSE_LOSS_WEIGHT * l_sparse_image
-                + TEXT_SPARSE_LOSS_WEIGHT * l_sparse_text
-            )
-            print(f"l_task : {l_task.item():.8f}")
+        if outputs.loss is not None and has_image_sparse:
+            l_select = outputs.loss
+            rho = float(getattr(self.config, "vision_pruner_rho", RHO))
+            lambda_sparse = float(getattr(self.config, "vision_pruner_lambda_sparse", LAMBDA_SPARSE))
+            l_sparse = (image_ste_masks_flat.mean() - rho) ** 2
+            if unselected_inputs_embeds is not None:
+                unselected_outputs = super().forward(
+                    input_ids=input_ids,
+                    attention_mask=unselected_attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=unselected_inputs_embeds,
+                    labels=unselected_labels,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=True,
+                )
+                l_unselect = (
+                    unselected_outputs.loss
+                    if unselected_outputs.loss is not None
+                    else l_select.detach()
+                )
+            else:
+                l_unselect = l_select.detach()
+
+            l_contrast = torch.relu(l_select - l_unselect)
+            weighted_l_sparse = lambda_sparse * l_sparse
+            total_loss = l_select + weighted_l_sparse + l_contrast
             print(
-                "weighted_l_sparse "
-                f"image={l_sparse_image.item():.8f}*{IMAGE_SPARSE_LOSS_WEIGHT:.1f}, "
-                f"text={l_sparse_text.item():.8f}*{TEXT_SPARSE_LOSS_WEIGHT:.1f}, "
-                f"total={weighted_l_sparse.item():.8f}"
+                "vision_pruner_loss "
+                f"task={l_select.item():.8f} "
+                f"sparse={weighted_l_sparse.item():.8f} "
+                f"contrast={l_contrast.item():.8f} "
+                f"unselect={l_unselect.item():.8f} "
+                f"total={total_loss.item():.8f}"
             )
-            total_loss = l_task + weighted_l_sparse
             outputs = CausalLMOutputWithPast(
                 loss=total_loss,
                 logits=outputs.logits,
@@ -520,22 +534,21 @@ class LlavaLlamaForCausalLM_with_VisionPruner(LlamaForCausalLM, LlavaMetaForCaus
         inputs: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
-        top_p: float = 1.0,
+        top_p: Optional[float] = None,
         text_top_p: Optional[float] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
-        prune_text_tokens = kwargs.pop("prune_text_tokens", None)
-        text_prune_mask = kwargs.pop("text_prune_mask", None)
-        # Ignore legacy callers; pruning now uses fixed TAU/RHO constants.
+        kwargs.pop("prune_text_tokens", None)
+        kwargs.pop("text_prune_mask", None)
         kwargs.pop("threshold", None)
+        selection_mode = kwargs.pop(
+            "vision_pruner_selection_mode",
+            "topk" if top_p is not None else "threshold",
+        )
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
-        if prune_text_tokens is False:
-            text_top_p = None
-        elif prune_text_tokens is True and text_top_p is None:
-            text_top_p = top_p
 
         if images is not None:
             orig_input_ids = inputs.clone()
@@ -564,16 +577,18 @@ class LlavaLlamaForCausalLM_with_VisionPruner(LlamaForCausalLM, LlavaMetaForCaus
                     inputs_embeds,
                     orig_attention_mask=orig_attention_mask,
                     exp_attention_mask=attention_mask,
-                    text_prune_mask=text_prune_mask,
                 )
                 image_slot_counts = get_image_slot_counts(
                     orig_input_ids,
                     orig_attention_mask=orig_attention_mask,
                 )
-                final_image_keep_counts = self._image_keep_counts_for_final_ratio(
-                    batch_image_ranges,
-                    top_p,
-                )
+                final_image_keep_counts = None
+                if selection_mode == "topk":
+                    keep_ratio = 1.0 if top_p is None else top_p
+                    final_image_keep_counts = self._image_keep_counts_for_final_ratio(
+                        batch_image_ranges,
+                        keep_ratio,
+                    )
                 (
                     inputs_embeds,
                     _,
@@ -591,22 +606,18 @@ class LlavaLlamaForCausalLM_with_VisionPruner(LlamaForCausalLM, LlavaMetaForCaus
                     attention_mask,
                     position_ids,
                     image_slot_counts=image_slot_counts,
-                    min_keep_ratio=top_p,
+                    min_keep_ratio=(top_p if selection_mode == "topk" and top_p is not None else None),
                     return_image_token_indices=True,
                 )
 
-                # 1. 이미지 토큰 score와 질문 텍스트 토큰 score를 따로 계산
                 scores = image_pruner(
                     input_ids=orig_input_ids,
                     hidden_states=inputs_embeds.detach(),
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     batch_image_ranges=batch_image_ranges,
-                    batch_text_indices=batch_text_indices,
                 )
 
-                # 2. 이미지 토큰은 원본 image token 수 기준 top_p 최종 개수로 프루닝한다.
-                #    텍스트 토큰은 text_top_p가 있을 때만 top-k 프루닝한다.
                 inputs_embeds, attention_mask, position_ids = prune_tokens_for_inference(
                     scores,
                     batch_image_ranges,
@@ -616,8 +627,10 @@ class LlavaLlamaForCausalLM_with_VisionPruner(LlamaForCausalLM, LlavaMetaForCaus
                     top_p=top_p,
                     image_keep_counts=final_image_keep_counts,
                     batch_text_indices=batch_text_indices,
-                    text_top_p=text_top_p,
+                    text_top_p=None,
                     image_token_indices=pre_prune_image_token_indices,
+                    tau=getattr(self.config, "vision_pruner_tau", TAU),
+                    selection_mode=selection_mode,
                 )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
